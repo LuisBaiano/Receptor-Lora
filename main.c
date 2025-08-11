@@ -1,135 +1,189 @@
 #include "pico/stdlib.h"
 #include <stdio.h>
 #include <string.h>
+
+// Includes dos periféricos do Pico SDK
+#include "hardware/spi.h"
 #include "hardware/i2c.h"
+#include "hardware/gpio.h"
+
+// Nossos próprios arquivos de cabeçalho
 #include "include/config.h"
 #include "include/lora.h"
 #include "include/display.h"
 #include "include/led_rgb.h"
-// Instância do objeto do display
+
+// --- Variáveis Globais ---
+// Instância principal para o objeto do display
 ssd1306_t display;
 
-// Estrutura para armazenar o último conjunto de dados recebido
-struct DadosRecebidos {
+// Estrutura para armazenar um conjunto de dados recebidos
+typedef struct {
     float temperatura;
     float umidade;
     float pressao;
-    int rssi;
-};
+} DadosRecebidos_t;
 
-// Variável para guardar os dados. O 'volatile' é essencial para a comunicação segura
-// entre a interrupção (callback) e o loop principal.
-volatile static struct DadosRecebidos ultimo_dado;
-volatile static bool novos_dados_recebidos = false;
-static uint32_t contador_pacotes = 0;
+// Variáveis 'volatile' para comunicação segura entre a interrupção (ISR) e o loop principal
+volatile bool novos_dados_recebidos = false;
+volatile int ultimo_rssi = 0;
+volatile uint32_t pacotes_recebidos = 0;
+DadosRecebidos_t dados_atuais = {0.0f, 0.0f, 0.0f}; // Zera os dados na inicialização
 
+// --- FUNÇÕES DE INICIALIZAÇÃO DE HARDWARE ---
 
 /**
- * @brief Função de callback. É chamada AUTOMATICAMENTE pela biblioteca LoRa
- *        quando um pacote válido é recebido. (Executada via interrupção)
+ * @brief Inicializa o barramento I2C1 para o display OLED.
+ */
+void setup_i2c_display() {
+    i2c_init(I2C_PORT, I2C_BAUDRATE);
+    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_PIN);
+    gpio_pull_up(I2C_SCL_PIN);
+    printf("I2C1 (Display) inicializado nos pinos SDA=%d, SCL=%d.\n", I2C_SDA_PIN, I2C_SCL_PIN);
+}
+
+/**
+ * @brief Inicializa o barramento SPI0 e os pinos GPIO associados para o LoRa.
+ * ESTA FUNÇÃO É A CORREÇÃO CRÍTICA.
+ */
+void setup_spi_lora() {
+    // Inicializa o periférico SPI em si
+    spi_init(LORA_SPI_PORT, 5 * 1000 * 1000); // 5 MHz
+
+    // Informa aos pinos GPIO para serem controlados pelo periférico SPI
+    gpio_set_function(LORA_SCK_PIN, GPIO_FUNC_SPI);
+    gpio_set_function(LORA_MOSI_PIN, GPIO_FUNC_SPI);
+    gpio_set_function(LORA_MISO_PIN, GPIO_FUNC_SPI);
+    
+    printf("SPI0 (LoRa) inicializado nos pinos SCK=%d, MOSI=%d, MISO=%d.\n", LORA_SCK_PIN, LORA_MOSI_PIN, LORA_MISO_PIN);
+}
+
+
+// --- FUNÇÃO DE CALLBACK DO LORA ---
+/**
+ * @brief É chamada AUTOMATICAMENTE pela biblioteca LoRa via interrupção
+ *        quando um pacote válido é recebido.
+ * @param payload Ponteiro para a estrutura com os dados recebidos.
  */
 void on_lora_receive(lora_payload_t* payload) {
-    // 1. Tenta extrair os dados da string recebida
-    // O transmissor envia "T:25.1,H:45,P:1012.3"
-    sscanf(payload->message, "T:%f,H:%f,P:%f",
-           &ultimo_dado.temperatura,
-           &ultimo_dado.umidade,
-           &ultimo_dado.pressao);
+    // Tenta decodificar a string no formato "T:25.1,H:45.0,P:1012.5"
+    // sscanf retorna o número de variáveis preenchidas com sucesso.
+    int items_parsed = sscanf((const char*)payload->message, "T:%f,H:%f,P:%f",
+                                &dados_atuais.temperatura,
+                                &dados_atuais.umidade,
+                                &dados_atuais.pressao);
 
-    // 2. Armazena os metadados do pacote
-    ultimo_dado.rssi = payload->rssi;
-    contador_pacotes++;
-
-    // 3. Sinaliza ao loop principal que há novos dados para processar
-    novos_dados_recebidos = true;
+    // Só considera os dados válidos se todos os 3 valores foram encontrados
+    if (items_parsed == 3) {
+        ultimo_rssi = payload->rssi;
+        pacotes_recebidos++;
+        // Sinaliza ao loop principal que há dados novos e válidos para processar
+        novos_dados_recebidos = true; 
+    } else {
+        // Ignora pacotes malformados, mas avisa no console para debug
+        printf("WARN: Pacote LoRa recebido com formato inesperado: %.*s\n", payload->length, payload->message);
+    }
 }
 
-// Função para inicializar o barramento I2C para o display
-void setup_i2c() {
-    i2c_init(I2C1_PORT, I2C_BAUDRATE);
-    gpio_set_function(I2C1_SDA_PIN, GPIO_FUNC_I2C);
-    gpio_set_function(I2C1_SCL_PIN, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C1_SDA_PIN);
-    gpio_pull_up(I2C1_SCL_PIN);
-}
+
+// --- FUNÇÃO PRINCIPAL ---
 
 int main() {
-    // Inicializa E/S padrão para debug via USB
+    // Inicializa a comunicação serial via USB para debug
     stdio_init_all();
-    sleep_ms(3000); // Pausa para dar tempo de abrir o monitor serial
+    sleep_ms(3000); // Pausa para dar tempo de conectar o monitor serial
 
-    // --- Inicialização dos Periféricos ---
+    // --- 1. Inicialização dos Periféricos de Hardware ---
+    printf("--- Iniciando Hardware do Receptor ---\n");
     rgb_led_init();
-    setup_i2c();
-    display_init(&display);
-    
-    // Mostra a tela de boas-vindas
-    display_startup_screen(&display);
-    rgb_led_set_color(COR_LED_AMARELO); // Amarelo enquanto inicializa
+    setup_i2c_display();
+    setup_spi_lora(); // <<< Chamada da função de correção
+    printf("--------------------------------------\n\n");
 
-    // --- Inicialização do LoRa ---
+    // --- 2. Inicialização dos Drivers e Módulos de Software ---
+    display_init(&display);
+    rgb_led_set_color(COR_LED_AMARELO); // Sinaliza "inicializando"
+    display_startup_screen(&display);   // Mostra tela de boas-vindas
+
+    // Prepara a configuração para o módulo LoRa
     lora_config_t config = {
         .spi_port = LORA_SPI_PORT,
         .interrupt_pin = LORA_INTERRUPT_PIN,
         .cs_pin = LORA_CS_PIN,
         .reset_pin = LORA_RESET_PIN,
-        .freq = 868.0,
+        .freq = LORA_FREQUENCY,
+        .tx_power = LORA_TX_POWER,
         .this_address = LORA_ADDRESS_RECEIVER
     };
 
-    if (lora_init(&config)) {
-        printf("Receptor LoRa inicializado. Endereco: %d\n", LORA_ADDRESS_RECEIVER);
-        rgb_led_set_color(COR_LED_AZUL); // Azul indica "pronto e aguardando"
-        display_wait_screen(&display);
-    } else {
+    // Inicializa o LoRa. Se falhar, é um erro fatal.
+    if (!lora_init(&config)) {
         printf("ERRO FATAL: Falha na inicializacao do LoRa.\n");
-        rgb_led_set_color(COR_LED_VERMELHO); // Vermelho indica erro fatal
-        // Trava em um loop infinito
-        while (1);
+        rgb_led_set_color(COR_LED_VERMELHO);
+        // Você poderia mostrar um erro no display aqui também
+        while (1); // Trava o programa
     }
+     
+    // --- 3. Finaliza a configuração e entra em modo de operação ---
+    lora_on_receive(on_lora_receive); // Registra a função de callback
     
-    // Registra nossa função para ser chamada na chegada de pacotes
-    lora_on_receive(on_lora_receive);
-    printf("Aguardando pacotes...\n");
+    printf("Inicializacao completa. Endereco: #%d. Aguardando pacotes...\n", LORA_ADDRESS_RECEIVER);
+    rgb_led_set_color(COR_LED_AZUL);   // Sinaliza "pronto e aguardando"
+    display_wait_screen(&display);     // Mostra tela de espera
 
-    // --- Loop Principal ---
-    // Este loop apenas verifica a flag. O recebimento acontece em segundo plano.
+    // --- 4. Loop Principal Infinito ---
     while (1) {
-        // Verifica se a interrupção sinalizou a chegada de novos dados
+        // Verifica se a rotina de interrupção sinalizou novos dados
         if (novos_dados_recebidos) {
             
-            // Trava e reseta a flag para evitar reprocessamento do mesmo dado
-            // Este pequeno bloco garante que a operação é "atômica"
-            // e segura contra interrupções.
+            // Variáveis locais para armazenar uma cópia segura dos dados
+            DadosRecebidos_t dados_copiados;
+            int rssi_copiado;
+            uint32_t contador_copiado;
+            
+            // --- Seção Crítica ---
+            // Desabilita a interrupção do LoRa temporariamente para evitar que
+            // as variáveis globais sejam modificadas enquanto as copiamos.
             gpio_set_irq_enabled(LORA_INTERRUPT_PIN, GPIO_IRQ_EDGE_RISE, false);
-            novos_dados_recebidos = false; 
-            gpio_set_irq_enabled(LORA_INTERRUPT_PIN, GPIO_IRQ_EDGE_RISE, true);
             
-            // --- Feedback Visual e Lógico ---
-            
-            // 1. Pisca o LED Verde para indicar recebimento
-            rgb_led_set_color(COR_LED_VERDE);
-            sleep_ms(100); // Mantém o LED verde por 100ms
-            rgb_led_set_color(COR_LED_AZUL); // Retorna à cor de "pronto"
-            
-            // 2. Imprime os dados no console serial para debug
-            printf("Pacote #%lu | T: %.1f, H: %.0f, P: %.1f | RSSI: %d\n",
-                   contador_pacotes, ultimo_dado.temperatura,
-                   ultimo_dado.umidade, ultimo_dado.pressao, ultimo_dado.rssi);
+            novos_dados_recebidos = false;        // Reseta a flag
+            dados_copiados = dados_atuais;        // Copia a estrutura de dados
+            rssi_copiado = ultimo_rssi;           // Copia o RSSI
+            contador_copiado = pacotes_recebidos; // Copia o contador
 
-            // 3. Atualiza o display OLED com os novos dados
+            // Reabilita a interrupção. O tempo desativado é mínimo.
+            gpio_set_irq_enabled(LORA_INTERRUPT_PIN, GPIO_IRQ_EDGE_RISE, true);
+            // --- Fim da Seção Crítica ---
+            
+            
+            // A partir daqui, trabalhamos apenas com as cópias, que são seguras.
+            
+            // 1. Feedback visual para o usuário
+            rgb_led_set_color(COR_LED_VERDE);
+            
+            // 2. Atualiza o display OLED com os dados copiados
             display_update_data(&display,
-                                ultimo_dado.temperatura,
-                                ultimo_dado.umidade,
-                                ultimo_dado.pressao,
-                                ultimo_dado.rssi,
-                                contador_pacotes);
+                                dados_copiados.temperatura,
+                                dados_copiados.umidade,
+                                dados_copiados.pressao,
+                                rssi_copiado,
+                                contador_copiado);
+            
+            // 3. Imprime um log no console para debug
+            printf("Pacote #%lu | T:%.1f, H:%.0f, P:%.1f | RSSI: %d\n",
+                   contador_copiado, dados_copiados.temperatura,
+                   dados_copiados.umidade, dados_copiados.pressao, rssi_copiado);
+            
+            // 4. Retorna o LED à cor de "pronto" após um breve piscar
+            sleep_ms(100);
+            rgb_led_set_color(COR_LED_AZUL);
         }
 
-        // Deixa a CPU dormir se não houver nada para fazer, economizando energia.
-        // A interrupção do LoRa acordará o sistema quando necessário.
+        // Deixa a CPU em um loop de baixa energia. A interrupção do LoRa a acordará.
         tight_loop_contents();
     }
 
-    return 0;
+    return 0; // Esta linha nunca será alcançada
 }

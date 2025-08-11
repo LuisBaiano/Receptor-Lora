@@ -13,7 +13,7 @@
  */
 void display_init(ssd1306_t *ssd) {
     // Inicializa o objeto ssd1306, associando-o ao barramento I2C correto
-    ssd1306_init(ssd, DISPLAY_WIDTH, DISPLAY_HEIGHT, false, DISPLAY_I2C_ADDR, I2C1_PORT);
+    ssd1306_init(ssd, DISPLAY_WIDTH, DISPLAY_HEIGHT, false, DISPLAY_I2C_ADDR, I2C_PORT);
 
     // Envia a sequência de comandos de configuração para o display
     ssd1306_config(ssd);
@@ -30,7 +30,7 @@ void display_init(ssd1306_t *ssd) {
 void display_startup_screen(ssd1306_t *ssd) {
     ssd1306_fill(ssd, false);
     const char *line1 = "Receptor LoRa";
-    const char *line2 = "Online";
+    const char *line2 = "Atividade 14";
     
     // Centraliza o texto horizontalmente
     uint8_t center_x = ssd->width / 2;
@@ -78,7 +78,7 @@ void display_update_data(ssd1306_t *ssd, float temp, float hum, float pres, int 
 
     // Linha 3: Força do sinal (RSSI)
     // Formata a string "Sinal (RSSI): -58"
-    snprintf(buffer, sizeof(buffer), "Sinal (RSSI): %d", rssi);
+    snprintf(buffer, sizeof(buffer), "RSSI: %d", rssi);
     ssd1306_draw_string(ssd, buffer, 2, 32);
     
     // Linha 4: Contador de pacotes recebidos

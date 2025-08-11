@@ -22,7 +22,7 @@ set(PICO_BOARD pico_w CACHE STRING "Board type")
 # Carrega o SDK do Pico
 include(pico_sdk_import.cmake)
 
-project(transmissor-lora C CXX ASM)
+project(receptor-lora C CXX ASM)
 pico_sdk_init()
 
 # Adiciona o executável e TODOS os arquivos fonte .c necessários
